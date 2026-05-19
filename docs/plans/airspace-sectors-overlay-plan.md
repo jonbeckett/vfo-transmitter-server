@@ -1,5 +1,17 @@
 # Air Traffic Services Sectors Overlay — Implementation Plan
 
+## Status — May 2026
+
+| Phase | Status |
+|---|---|
+| Phase 1 — FAA ADDS (US airspace) | **Implemented** — debugging sector polygon visibility |
+| Phase 2 — OpenAIP (worldwide) | Deferred |
+| Phase 3+ — enhancements | Deferred |
+
+**Phase 1 is code-complete.** All JS methods, PHP proxy, CSS, toolbar button, keyboard shortcut, spinner, DivIcon labels, and hover tooltip are written and syntax-validated. A rendering bug (sector polygons not visually appearing) is under investigation — the `eachLayer` refactor (moving all `onEachFeature` work outside `L.geoJSON()`) is the latest fix attempt.
+
+---
+
 ## Overview
 
 Add an optional translucent overlay of ATS (Air Traffic Services) sector boundaries to the Leaflet radar map. The feature follows the existing pattern used by the weather radar overlay: a toolbar toggle button, a dedicated Leaflet layer group, and viewport-aware data loading with aggressive caching.
@@ -190,12 +202,21 @@ Each airspace class gets a distinct translucent fill and border:
 
 All colours will adapt to the active colour scheme where appropriate (e.g., use the scheme's `accentColor` for borders in monochrome modes).
 
-### 5.2 Popup on Click
+### 5.2 Hover Tooltip *(implemented — design changed from original popup plan)*
 
-Clicking a sector polygon shows a Leaflet popup with:
+The original plan called for a click-activated popup. The implemented design uses a **sticky hover tooltip** (`bindTooltip` with `sticky: true`) that follows the cursor and shows all available API fields:
+
 - Sector name / designator
-- Airspace class
-- Altitude limits (lower / upper)
+- Class and type code
+- IDENT / ICAO ID
+- Altitude limits (lower / upper), formatted via `_formatAirspaceAlt()`
+- Sector code, city/state, operating hours, military authority
+
+The tooltip is styled via `.leaflet-tooltip.airspace-hover-tooltip` in `radar.css` with the dark semi-transparent radar aesthetic.
+
+### 5.3a Permanent Name Labels *(implemented — beyond original plan)*
+
+DivIcon markers are placed at the `getBounds().getCenter()` of each sector polygon and show a short name label (e.g. `B KSFO`, `C KBDL`, `ZBW` for ARTCC). Labels are hidden below zoom 7 via a CSS class toggle on the map container (`.airspace-labels-visible`). Built by `_buildAirspaceLabel()`, styled via `.airspace-label` in `radar.css`.
 
 ### 5.3 Layer Ordering
 
@@ -277,39 +298,44 @@ Response: GeoJSON `FeatureCollection`
 
 ## 8. Implementation Steps
 
-### Step 1 — Server-side proxy with caching
-Create `airspace_data.php`:
-- Accept and validate query parameters
-- Build FAA ArcGIS query URL
-- Check APCu cache, fetch on miss
-- Return GeoJSON with cache headers
-- Add basic rate limiting
+### Step 1 — Server-side proxy with caching ✅
+`airspace_data.php` created:
+- `dataset` (class / boundary) and bbox params, validated
+- FAA ADDS `Class_Airspace` and `Boundary_Airspace` endpoints
+- APCu cache (24h TTL), bbox snapped to 5° grid
+- Rate limiting (60 req/min/IP via APCu counter)
+- `Cache-Control: public, max-age=86400` response headers
 
-### Step 2 — Client-side airspace manager
-Add to `RadarDisplay` in `radar.js`:
-- New properties: `airspaceSectorsEnabled`, `airspaceLayer`, `airspaceCache`, `_airspaceDebounce`
-- Create `airspacePane` in `initMap()`
-- Implement `toggleAirspaceSectors()`, `loadAirspaceSectors()`, `clearAirspaceSectors()`, `updateAirspaceButton()`
-- Wire up `moveend` event in `handleMapMove()`
+### Step 2 — Client-side airspace manager ✅
+Added to `RadarDisplay`:
+- Properties: `airspaceSectorsEnabled`, `airspaceLayer`, `airspaceCache`, `_airspaceDebounce`, `airspaceSource`, `openAipApiKey`, `airspaceDialogOpen`, `_loadingCount`
+- `initMap()`: creates `airspacePane` at zIndex 300, creates `airspaceLayer` L.layerGroup, applies initial `.airspace-labels-visible` CSS class
+- `toggleAirspaceSectors()`, `loadAirspaceSectors()`, `clearAirspaceSectors()`, `updateAirspaceButton()` all implemented
+- `handleMapMove()` wired; `handleZoomChange()` toggles `.airspace-labels-visible` on map container
+- `renderAirspaceSectors(geojson, dataset)` — `L.geoJSON` with style+filter only; `eachLayer` second pass for tooltips and DivIcon labels
+- Helper methods: `_buildAirspaceLabel()`, `_buildAirspaceTooltip()`, `_formatAirspaceAlt()`
+- Spinner: `_startLoading()` / `_stopLoading()` with `_loadingCount` reference counter; 250ms CSS reveal delay
 
-### Step 3 — Toolbar integration
-- Add button to toolbar (in `initCustomToolbar()`)
-- Add keyboard shortcut `A` (in `initKeyboardShortcuts()`)
-- Add button colour updates to `updateInterfaceColors()`
+### Step 3 — Toolbar integration ✅
+- Airspace button added to toolbar with `fa-vector-square` icon
+- Keyboard shortcut `A` wired in `initKeyboardShortcuts()`
+- Button colour updates in `updateInterfaceColors()`
 
-### Step 4 — Styling and popups
-- Define per-class style function for `L.geoJSON({ style })`
-- Add `onEachFeature` click handler for sector info popup
-- Implement zoom-level gating to show/hide classes
+### Step 4 — Styling and hover tooltip ✅ *(design changed from popup to hover tooltip)*
+- `getAirspaceStyle(feature)` defines per-class fills and borders
+- Zoom-level gating in `airspaceFeatureVisible()` (ARTCC at zoom 3+, Class B at 6+, etc.)
+- Sticky hover tooltip via `bindTooltip` with full field display
+- Permanent DivIcon name labels hidden below zoom 7
+- All CSS in `radar.css`: `.airspace-label`, `.airspace-hover-tooltip`, spinner styles
 
-### Step 5 — Testing and refinement (Phase 1)
-- Test with various zoom levels and viewport positions
-- Verify cache hit rates in APCu
-- Confirm no redundant API calls via browser network tab
-- Test across all colour schemes
+### Step 5 — Testing and refinement ⚠️ IN PROGRESS
+- Sector polygon outlines/fills not visually appearing (labels and tooltips work)
+- Latest fix: removed `onEachFeature` from `L.geoJSON()` options entirely; all per-feature work moved to `eachLayer` second pass with per-step try/catch
+- `node --check` passes; browser console `[Airspace]` error logging in place
+- Remaining: confirm fix in browser, verify cache hit rates, test across colour schemes
 
 ### Steps 6–10 — Phase 2 (OpenAIP worldwide coverage)
-See §11.5 for the full Phase 2 step breakdown. These steps are deferred until Phase 1 is stable.
+Deferred until Phase 1 is stable and sector rendering bug is resolved.
 
 ---
 
@@ -468,4 +494,4 @@ The `renderAirspaceSectors()` method is identical for both sources because the P
 - **Airspace type filter sub-panel** to toggle individual classes
 - **3D altitude filtering** — show only sectors relevant to a selected flight level
 - **VATSIM/IVAO active sector highlighting** — highlight sectors where ATC is online
-- **Sector label rendering** — draw sector names/identifiers at polygon centroids
+- ~~Sector label rendering~~ — **implemented in Phase 1** (DivIcon labels at polygon centroids, zoom-gated)

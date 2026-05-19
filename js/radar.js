@@ -73,6 +73,18 @@ class RadarDisplay {
         this.weatherRadarLayer = null;
         this.weatherRadarUpdateTimer = null;
         
+        // Airspace sectors overlay
+        this.airspaceSectorsEnabled = false;
+        this.airspaceLayer = null;
+        this.airspaceCache = new Map();
+        this._airspaceDebounce = null;
+        this.airspaceSource = 'faa'; // 'faa' | 'openaip'
+        this.openAipApiKey = '';
+        this.airspaceDialogOpen = false;
+
+        // Async loading indicator
+        this._loadingCount = 0;
+
         // MapBox integration
         this.mapboxToken = '';
         this.mapboxStyleId = 'streets-v12';
@@ -544,6 +556,16 @@ class RadarDisplay {
             this.currentColorScheme = savedColorScheme;
         }
         
+        // Load airspace settings from cookies
+        const savedAirspaceSource = this.getCookie('airspaceSource');
+        if (savedAirspaceSource && ['faa', 'openaip'].includes(savedAirspaceSource)) {
+            this.airspaceSource = savedAirspaceSource;
+        }
+        const savedOpenAipKey = this.getCookie('openAipApiKey');
+        if (savedOpenAipKey) {
+            this.openAipApiKey = savedOpenAipKey;
+        }
+
         // Check if there's a group parameter in the URL
         const urlParams = new URLSearchParams(window.location.search);
         const hasGroupParam = urlParams.has('group');
@@ -569,6 +591,11 @@ class RadarDisplay {
             zoomControl: false // Disable default zoom controls
         }).setView([39.8283, -98.5795], 4); // Center on USA
         
+        // Create a pane for airspace sectors (below trails and aircraft markers)
+        this.map.createPane('airspacePane');
+        this.map.getPane('airspacePane').style.zIndex = 300;
+        this.airspaceLayer = L.layerGroup().addTo(this.map);
+
         // Create a separate pane for trails so they appear below everything else
         this.map.createPane('trailPane');
         this.map.getPane('trailPane').style.zIndex = 350; // Below markers (400) and labels
@@ -607,6 +634,15 @@ class RadarDisplay {
         // Initialize interface colors for the default tile layer
         this.updateInterfaceColors();
         
+        // Create loading spinner element
+        const spinner = document.createElement('div');
+        spinner.id = 'loading-spinner';
+        spinner.setAttribute('aria-hidden', 'true');
+        document.body.appendChild(spinner);
+
+        // Set initial CSS class for airspace sector label visibility
+        this.map.getContainer().classList.toggle('airspace-labels-visible', this.map.getZoom() >= 7);
+
         console.log('Radar map initialized');
     }
     
@@ -743,6 +779,7 @@ class RadarDisplay {
     }
     
     async fetchRadarData() {
+        this._startLoading();
         try {
             const response = await fetch(this.radarDataUrl);
             if (!response.ok) {
@@ -764,6 +801,8 @@ class RadarDisplay {
         } catch (error) {
             console.error('Error fetching radar data:', error);
             return [];
+        } finally {
+            this._stopLoading();
         }
     }
     
@@ -1629,6 +1668,9 @@ class RadarDisplay {
         // Update label visibility based on zoom level
         const zoom = this.map.getZoom();
         const showLabels = zoom >= 6; // Only show labels at zoom level 6 and above
+
+        // Toggle airspace sector label visibility
+        this.map.getContainer().classList.toggle('airspace-labels-visible', zoom >= 7);
         
         for (const [callsign, labelGroup] of this.labelLayers) {
             if (showLabels) {
@@ -1658,6 +1700,12 @@ class RadarDisplay {
         // Update grid when map is panned
         if (this.gridVisible) {
             this.createGrid();
+        }
+
+        // Reload airspace sectors for the new viewport (debounced)
+        if (this.airspaceSectorsEnabled) {
+            clearTimeout(this._airspaceDebounce);
+            this._airspaceDebounce = setTimeout(() => this.loadAirspaceSectors(), 500);
         }
     }
     
@@ -2097,6 +2145,22 @@ class RadarDisplay {
             e.stopPropagation();
             this.toggleWeatherRadar();
         });
+
+        const airspaceBtn = document.createElement('button');
+        airspaceBtn.className = 'toolbar-btn';
+        airspaceBtn.innerHTML = '<i class="fas fa-vector-square"></i>';
+        airspaceBtn.title = 'Toggle Airspace Sectors (B)';
+        airspaceBtn.id = 'airspace-btn';
+        airspaceBtn.addEventListener('click', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            this.toggleAirspaceSectors();
+        });
+        airspaceBtn.addEventListener('contextmenu', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            this.openAirspaceSettingsDialog();
+        });
         
         const mapboxBtn = document.createElement('button');
         mapboxBtn.className = 'toolbar-btn';
@@ -2154,7 +2218,7 @@ class RadarDisplay {
         toolbar.appendChild(dataGroup);
         
         // Display Options group
-        const displayGroup = this.createToolbarGroup('display', 'eye', 'Display', [gridBtn, trailsBtn, weatherBtn]);
+        const displayGroup = this.createToolbarGroup('display', 'eye', 'Display', [gridBtn, trailsBtn, weatherBtn, airspaceBtn]);
         toolbar.appendChild(displayGroup);
         
         // Movement & Tools group
@@ -2177,6 +2241,7 @@ class RadarDisplay {
         this.updateSmoothButton();
         this.updateTrailsButton();
         this.updateWeatherButton();
+        this.updateAirspaceButton();
         this.updateGroupFilterButton(); // Update filter button based on URL params/saved state
         
         // Load expanded groups state
@@ -2465,6 +2530,11 @@ class RadarDisplay {
                 case 'w':
                 case 'W':
                     this.toggleWeatherRadar();
+                    e.preventDefault();
+                    break;
+                case 'b':
+                case 'B':
+                    this.toggleAirspaceSectors();
                     e.preventDefault();
                     break;
                 case 'm':
@@ -3482,6 +3552,7 @@ class RadarDisplay {
     }
     
     async loadWeatherRadar() {
+        this._startLoading();
         try {
             // Use RainViewer API for weather radar data
             const response = await fetch('https://api.rainviewer.com/public/weather-maps.json');
@@ -3518,6 +3589,8 @@ class RadarDisplay {
             }
         } catch (error) {
             console.error('Error loading weather radar:', error);
+        } finally {
+            this._stopLoading();
         }
     }
     
@@ -4571,6 +4644,7 @@ class RadarDisplay {
         this.updateSmoothButton();
         this.updateTrailsButton();
         this.updateWeatherButton();
+        this.updateAirspaceButton();
         
         // Update tracking indicator if tracking is active
         if (this.isTrackingEnabled && this.trackedCallsign) {
@@ -5296,6 +5370,396 @@ class RadarDisplay {
                 label._icon.style.borderColor = colors.primaryColor;
             }
         });
+    }
+
+    // -----------------------------------------------------------------------
+    // Airspace Sectors Overlay
+    // -----------------------------------------------------------------------
+
+    toggleAirspaceSectors() {
+        // If OpenAIP is selected but no key is stored, open settings instead
+        if (!this.airspaceSectorsEnabled &&
+            this.airspaceSource === 'openaip' &&
+            !this.openAipApiKey) {
+            this.openAirspaceSettingsDialog();
+            return;
+        }
+
+        this.airspaceSectorsEnabled = !this.airspaceSectorsEnabled;
+
+        if (this.airspaceSectorsEnabled) {
+            this.loadAirspaceSectors();
+        } else {
+            this.clearAirspaceSectors();
+        }
+
+        this.updateAirspaceButton();
+        console.log(`Airspace sectors ${this.airspaceSectorsEnabled ? 'enabled' : 'disabled'}`);
+    }
+
+    updateAirspaceButton() {
+        const btn = document.getElementById('airspace-btn');
+        if (!btn) return;
+
+        const colors = this.colorSchemes[this.currentColorScheme];
+        if (this.airspaceSectorsEnabled) {
+            btn.style.background   = colors.accentColor;
+            btn.style.color        = '#ffffff';
+            btn.style.borderColor  = colors.accentColor;
+            btn.title = 'Disable Airspace Sectors (B) — right-click for settings';
+        } else {
+            btn.style.background   = colors.backgroundColor;
+            btn.style.color        = colors.primaryColor;
+            btn.style.borderColor  = colors.primaryColor;
+            btn.title = 'Toggle Airspace Sectors (B) — right-click for settings';
+        }
+    }
+
+    loadAirspaceSectors() {
+        // Clear old layers before re-rendering to avoid accumulation on pan
+        this.clearAirspaceSectors();
+
+        const bounds   = this.map.getBounds();
+        const gridSize = 5;
+        const snapped  = {
+            minLat: Math.floor(bounds.getSouth() / gridSize) * gridSize,
+            minLon: Math.floor(bounds.getWest()  / gridSize) * gridSize,
+            maxLat: Math.ceil(bounds.getNorth()  / gridSize) * gridSize,
+            maxLon: Math.ceil(bounds.getEast()   / gridSize) * gridSize,
+        };
+
+        const zoom     = this.map.getZoom();
+        const datasets = this.getAirspaceDatasetsForZoom(zoom);
+
+        datasets.forEach(dataset => {
+            const cacheKey = `${dataset}:${snapped.minLat},${snapped.minLon},${snapped.maxLat},${snapped.maxLon}`;
+
+            if (this.airspaceCache.has(cacheKey)) {
+                if (this.airspaceSectorsEnabled) {
+                    this.renderAirspaceSectors(this.airspaceCache.get(cacheKey), dataset);
+                }
+                return;
+            }
+
+            const params = new URLSearchParams({
+                source:  this.airspaceSource,
+                dataset,
+                minLat:  snapped.minLat,
+                minLon:  snapped.minLon,
+                maxLat:  snapped.maxLat,
+                maxLon:  snapped.maxLon,
+            });
+
+            if (this.airspaceSource === 'openaip' && this.openAipApiKey) {
+                params.set('key', this.openAipApiKey);
+            }
+
+            this._startLoading();
+            fetch(`airspace_data.php?${params}`)
+                .then(r => {
+                    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+                    return r.json();
+                })
+                .then(geojson => {
+                    this.airspaceCache.set(cacheKey, geojson);
+                    if (this.airspaceSectorsEnabled) {
+                        this.renderAirspaceSectors(geojson, dataset);
+                    }
+                })
+                .catch(err => console.error('Error loading airspace sectors:', err))
+                .finally(() => this._stopLoading());
+        });
+    }
+
+    getAirspaceDatasetsForZoom(zoom) {
+        // Always load both datasets — boundary for ARTCC/FIR, class for B/C/D/E
+        // airspaceFeatureVisible() suppresses small classes at low zoom
+        return ['boundary', 'class'];
+    }
+
+    clearAirspaceSectors() {
+        if (this.airspaceLayer) {
+            this.airspaceLayer.clearLayers();
+        }
+    }
+
+    renderAirspaceSectors(geojson, dataset) {
+        if (!geojson || !Array.isArray(geojson.features)) return;
+
+        const zoom = this.map.getZoom();
+        const self = this;
+
+        // Build the GeoJSON polygon layer with ONLY style/filter callbacks —
+        // both were working before this change and cannot throw. Moving tooltip
+        // and label work to the eachLayer pass below ensures that any per-feature
+        // error can never abort sector polygon rendering.
+        let geoJsonLayer;
+        try {
+            geoJsonLayer = L.geoJSON(geojson, {
+                pane:   'airspacePane',
+                style:  feature => self.getAirspaceStyle(feature),
+                filter: feature => self.airspaceFeatureVisible(feature, zoom),
+            }).addTo(this.airspaceLayer);
+        } catch (renderErr) {
+            console.error('[Airspace] L.geoJSON render error:', renderErr);
+            return;
+        }
+
+        // Second pass: bind hover tooltip and add permanent DivIcon label.
+        // Each step is wrapped in try/catch so a bad feature never breaks others.
+        geoJsonLayer.eachLayer(layer => {
+            if (!layer.feature) return;
+            const p = layer.feature.properties || {};
+
+            // Hover tooltip
+            try {
+                layer.bindTooltip(self._buildAirspaceTooltip(p), {
+                    sticky:    true,
+                    direction: 'top',
+                    opacity:   0.97,
+                    className: 'airspace-hover-tooltip',
+                });
+            } catch (ttErr) {
+                console.warn('[Airspace] tooltip bind error:', ttErr);
+            }
+
+            // Permanent name label
+            const labelHtml = self._buildAirspaceLabel(p);
+            if (!labelHtml) return;
+            try {
+                const center = layer.getBounds().getCenter();
+                L.marker(center, {
+                    icon: L.divIcon({
+                        className: `airspace-label airspace-label-${(p.CLASS || 'other').toLowerCase()}`,
+                        html:      labelHtml,
+                        iconSize:  null,
+                        iconAnchor: null,
+                    }),
+                    interactive:  false,
+                    zIndexOffset: -500,
+                }).addTo(self.airspaceLayer);
+            } catch (lblErr) {
+                console.warn('[Airspace] label error:', lblErr);
+            }
+        });
+    }
+
+    getAirspaceStyle(feature) {
+        const p         = feature.properties || {};
+        const classCode = (p.CLASS || p.TYPE_CODE || '').toUpperCase();
+        const name      = (p.NAME  || '').toUpperCase();
+
+        // ARTCC / FIR / ADIZ boundaries
+        if (name.includes('ARTCC') || name.includes(' FIR') ||
+            classCode === 'ARTCC'  || classCode === 'FIR' || classCode === 'UIR') {
+            return { pane: 'airspacePane', fillColor: '#888888', color: '#888888', weight: 1, dashArray: '6,4', fillOpacity: 0.08 };
+        }
+
+        const styles = {
+            'B': { fillColor: '#0066cc', color: '#0066cc', weight: 2, dashArray: null,  fillOpacity: 0.12 },
+            'C': { fillColor: '#cc6600', color: '#cc6600', weight: 2, dashArray: null,  fillOpacity: 0.12 },
+            'D': { fillColor: '#0099cc', color: '#0099cc', weight: 1, dashArray: null,  fillOpacity: 0.10 },
+            'E': { fillColor: '#009900', color: '#009900', weight: 1, dashArray: '4,4', fillOpacity: 0.08 },
+        };
+
+        const s = styles[classCode] || { fillColor: '#888888', color: '#888888', weight: 1, dashArray: '4,4', fillOpacity: 0.07 };
+        return { pane: 'airspacePane', ...s };
+    }
+
+    airspaceFeatureVisible(feature, zoom) {
+        const p         = feature.properties || {};
+        const classCode = (p.CLASS || p.TYPE_CODE || '').toUpperCase();
+        const name      = (p.NAME  || '').toUpperCase();
+
+        if (name.includes('ARTCC') || name.includes(' FIR') ||
+            classCode === 'ARTCC'  || classCode === 'FIR' || classCode === 'UIR') {
+            return zoom >= 3;
+        }
+        if (classCode === 'B') return zoom >= 6;
+        if (classCode === 'C') return zoom >= 9;
+        if (classCode === 'D') return zoom >= 9;
+        if (classCode === 'E') return zoom >= 12;
+        // Unknown type — show at zoom 3+ so ADIZ/SUA boundaries are visible
+        return zoom >= 3;
+    }
+
+    openAirspaceSettingsDialog() {
+        if (this.airspaceDialogOpen) return;
+        this.airspaceDialogOpen = true;
+
+        const dialog  = document.createElement('div');
+        dialog.className = 'mapbox-dialog';
+
+        const content = document.createElement('div');
+        content.className = 'mapbox-dialog-content';
+
+        const title = document.createElement('h2');
+        title.textContent = 'Airspace Settings';
+        content.appendChild(title);
+
+        // Data source selector
+        const sourceSection = document.createElement('div');
+        sourceSection.className = 'mapbox-token-section';
+
+        const sourceHeading = document.createElement('p');
+        sourceHeading.innerHTML = '<strong>Data Source:</strong>';
+        sourceSection.appendChild(sourceHeading);
+
+        [
+            { value: 'faa',     label: 'FAA ADDS — United States only (no key required)' },
+            { value: 'openaip', label: 'OpenAIP — Worldwide (free API key required)' },
+        ].forEach(opt => {
+            const lbl = document.createElement('label');
+            lbl.style.cssText = 'display:block;margin-bottom:6px;cursor:pointer;';
+
+            const radio = document.createElement('input');
+            radio.type  = 'radio';
+            radio.name  = 'airspace-source';
+            radio.value = opt.value;
+            radio.checked = (this.airspaceSource === opt.value);
+            radio.style.marginRight = '8px';
+
+            lbl.appendChild(radio);
+            lbl.appendChild(document.createTextNode(opt.label));
+            sourceSection.appendChild(lbl);
+        });
+
+        content.appendChild(sourceSection);
+
+        // OpenAIP key
+        const keySection = document.createElement('div');
+        keySection.className = 'mapbox-token-section';
+
+        const keyInfo = document.createElement('p');
+        keyInfo.className = 'mapbox-info';
+        keyInfo.innerHTML = 'OpenAIP API Key — get a free key at <a href="https://www.openaip.net" target="_blank">openaip.net</a>';
+        keySection.appendChild(keyInfo);
+
+        const keyLabel = document.createElement('label');
+        keyLabel.setAttribute('for', 'openaip-key-input');
+        keyLabel.textContent = 'OpenAIP API Key:';
+        keySection.appendChild(keyLabel);
+
+        const keyInput = document.createElement('input');
+        keyInput.type  = 'text';
+        keyInput.id    = 'openaip-key-input';
+        keyInput.value = this.openAipApiKey;
+        keyInput.placeholder = 'Enter your OpenAIP API key';
+        keySection.appendChild(keyInput);
+
+        const saveKeyBtn = document.createElement('button');
+        saveKeyBtn.className   = 'mapbox-btn';
+        saveKeyBtn.textContent = 'Save Key';
+        keySection.appendChild(saveKeyBtn);
+
+        const clearKeyBtn = document.createElement('button');
+        clearKeyBtn.className   = 'mapbox-btn mapbox-btn-secondary';
+        clearKeyBtn.textContent = 'Clear Key';
+        keySection.appendChild(clearKeyBtn);
+
+        content.appendChild(keySection);
+
+        const closeBtn = document.createElement('button');
+        closeBtn.className   = 'mapbox-btn mapbox-btn-close';
+        closeBtn.textContent = 'Close';
+        content.appendChild(closeBtn);
+
+        dialog.appendChild(content);
+        document.body.appendChild(dialog);
+
+        // --- Event listeners ---
+
+        // Source radio change
+        content.querySelectorAll('input[name="airspace-source"]').forEach(radio => {
+            radio.addEventListener('change', () => {
+                this.airspaceSource = radio.value;
+                this.setCookie('airspaceSource', this.airspaceSource, 365);
+            });
+        });
+
+        saveKeyBtn.addEventListener('click', () => {
+            const key = keyInput.value.trim();
+            this.openAipApiKey = key;
+            this.setCookie('openAipApiKey', key, 365);
+        });
+
+        clearKeyBtn.addEventListener('click', () => {
+            this.openAipApiKey = '';
+            keyInput.value = '';
+            this.setCookie('openAipApiKey', '', -1);
+        });
+
+        closeBtn.addEventListener('click', () => {
+            dialog.remove();
+            this.airspaceDialogOpen = false;
+        });
+    }
+
+    _buildAirspaceLabel(p) {
+        const cls  = (p.CLASS    || '').toUpperCase();
+        const name = (p.NAME     || '').toUpperCase();
+        const type = (p.TYPE_CODE || '').toUpperCase();
+        const isARTCC = name.includes('ARTCC') || name.includes(' FIR') ||
+                        type === 'ARTCC' || type === 'FIR' || type === 'UIR';
+
+        if (isARTCC) {
+            const text = p.IDENT || name.split(' ')[0] || '';
+            return text ? `<span>${text}</span>` : null;
+        }
+        if (!cls || cls === 'MODE-C') return null; // suppress noisy Mode-C veil labels
+        const ident = p.IDENT || p.ICAO_ID || '';
+        const text  = ident ? `${cls} ${ident}` : cls;
+        return `<span>${text}</span>`;
+    }
+
+    _buildAirspaceTooltip(p) {
+        const name   = p.NAME      || p.IDENT || '—';
+        const cls    = p.CLASS     || '';
+        const ident  = p.IDENT     || '';
+        const icao   = p.ICAO_ID   || '';
+        const city   = p.CITY      || '';
+        const state  = p.STATE     || '';
+        const sector = p.SECTOR    || '';
+        const wkhr   = p.WKHR_CODE || '';
+        const wkhrR  = p.WKHR_RMK  || '';
+        const mil    = p.MIL_CODE  || '';
+        const type   = p.TYPE_CODE || '';
+
+        const lower = this._formatAirspaceAlt(p.LOWER_VAL, p.LOWER_UOM, p.LOWER_CODE);
+        const upper = this._formatAirspaceAlt(p.UPPER_VAL, p.UPPER_UOM, p.UPPER_CODE);
+
+        let rows = `<div class="ast-name">${name}</div>`;
+        if (cls || type)  rows += `<div class="ast-row"><span>Class/Type:</span> ${[cls, type].filter(Boolean).join(' / ')}</div>`;
+        if (ident)        rows += `<div class="ast-row"><span>IDENT:</span> ${ident}${icao && icao !== ident ? ` (${icao})` : ''}</div>`;
+        rows +=                   `<div class="ast-row"><span>Altitude:</span> ${lower} — ${upper}</div>`;
+        if (sector)       rows += `<div class="ast-row"><span>Sector:</span> ${sector}</div>`;
+        if (city || state) rows += `<div class="ast-row"><span>Location:</span> ${[city, state].filter(Boolean).join(', ')}</div>`;
+        const hours = wkhr ? (wkhr + (wkhrR ? ' — ' + wkhrR : '')) : '';
+        if (hours)        rows += `<div class="ast-row"><span>Hours:</span> ${hours}</div>`;
+        if (mil)          rows += `<div class="ast-row"><span>Authority:</span> ${mil}</div>`;
+
+        return `<div class="airspace-tooltip-inner">${rows}</div>`;
+    }
+
+    _formatAirspaceAlt(val, uom, code) {
+        if (code === 'SFC') return 'Surface';
+        if (code === 'UNL' || val == null || val >= 99000) return 'Unlimited';
+        const feet = val.toLocaleString();
+        return `${feet} ${uom || 'ft'} ${code || 'MSL'}`.trim();
+    }
+
+    _startLoading() {
+        this._loadingCount++;
+        const el = document.getElementById('loading-spinner');
+        if (el) el.classList.add('active');
+    }
+
+    _stopLoading() {
+        this._loadingCount = Math.max(0, this._loadingCount - 1);
+        if (this._loadingCount === 0) {
+            const el = document.getElementById('loading-spinner');
+            if (el) el.classList.remove('active');
+        }
     }
 }
 
